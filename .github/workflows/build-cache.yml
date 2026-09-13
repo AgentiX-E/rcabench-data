@@ -22,6 +22,14 @@ on:
         description: 'Download only the first N bytes (0 = full 13.4 GB)'
         required: false
         default: '0'
+      download_deadline_seconds:
+        description: >-
+          Total wall-clock budget for the archive download, in seconds. Only
+          reached by retrying; a healthy download of the full 13.4 GB has taken
+          2h24m, so this must be sized in hours. Leave room for the convert
+          (37m) + shard (16m) + upload steps under the 6h job cap.
+        required: false
+        default: '17000'
 
 permissions:
   contents: write
@@ -65,19 +73,47 @@ jobs:
       # while the archive spools, and mid-stream drops are common. The /content
       # endpoint (unlike ?download=1) honours Range/resume, so retry on ALL
       # errors and resume with -C -.
+      #
+      # `--retry`'s fixed count is the wrong shape for this failure, and that was
+      # measured rather than assumed: run 34752201606 hit a continuous 504 storm
+      # and consumed `--retry 30 --retry-delay 20` in 25 minutes with ZERO bytes
+      # transferred, failing the job with `curl: (22)` -- while a healthy
+      # download of the same object took 2h24m (run 34586313254). A cold spool
+      # cannot be waited out by a fixed number of attempts; the budget has to be
+      # a deadline in hours, and the loop below makes it one. `-C -` keeps every
+      # partial attempt's progress, so retrying never re-downloads what landed.
       - name: Download RCABench archive
         run: |
           mkdir -p "$HOME/rcabench"
+          ARCHIVE="$HOME/rcabench/rcabench-absolute_anomaly.tar.gz"
+          DEADLINE=$((SECONDS + ${{ inputs.download_deadline_seconds }}))
           RANGE_ARG=()
           if [ "${{ inputs.download_prefix_bytes }}" != "0" ]; then
             RANGE_ARG=(-r "0-${{ inputs.download_prefix_bytes }}")
           fi
-          curl -L --fail --retry 30 --retry-all-errors --retry-delay 20 \
-            --connect-timeout 60 --speed-limit 1024 --speed-time 90 \
-            -C - "${RANGE_ARG[@]}" \
-            -o "$HOME/rcabench/rcabench-absolute_anomaly.tar.gz" \
-            "https://zenodo.org/api/records/17105974/files/rcabench-absolute_anomaly.tar.gz/content"
-          ls -lh "$HOME/rcabench/rcabench-absolute_anomaly.tar.gz"
+          attempt=0
+          while :; do
+            attempt=$((attempt + 1))
+            echo "── attempt $attempt, $((DEADLINE - SECONDS))s of budget left ──"
+            # A bounded per-attempt retry rides out a single mid-stream drop;
+            # anything longer is handled by the loop, which is the only layer
+            # that can outlast a 504 that lasts tens of minutes.
+            if curl -L --fail --retry 3 --retry-all-errors --retry-delay 30 \
+                 --connect-timeout 60 --speed-limit 1024 --speed-time 90 \
+                 -C - "${RANGE_ARG[@]}" \
+                 -o "$ARCHIVE" \
+                 "https://zenodo.org/api/records/17105974/files/rcabench-absolute_anomaly.tar.gz/content"; then
+              break
+            fi
+            SIZE=$(du -h "$ARCHIVE" 2>/dev/null | cut -f1)
+            echo "attempt $attempt failed; on disk: ${SIZE:-nothing}"
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Zenodo did not serve the archive within ${DEADLINE}s; giving up after $attempt attempts."
+              exit 1
+            fi
+            sleep 60
+          done
+          ls -lh "$ARCHIVE"
           df -h "$HOME"
 
       - name: Convert Parquet to JSON (streaming)
